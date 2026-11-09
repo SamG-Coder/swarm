@@ -7,6 +7,8 @@ from the image they just produced.
 
 Rust core (zero dependencies) + WebGPU compute shaders, running in the browser.
 
+**[Live demo](https://samg-coder.github.io/swarm/)** (needs a browser with WebGPU)
+
 ![gyroid](docs/gyroid.png)
 
 ## The idea
