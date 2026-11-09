@@ -62,7 +62,8 @@ fn splat_depth(at: Proj) {
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(workgroup_id) block: vec3u) {
-  let i = gid.x;
+  let i = gid.x + gid.y * ROW;
+  let turn = block.x + block.y * (ROW / 256u);    // this workgroup's index
   let n_active = u.res.z;
   if (i >= n_active) { return; }
   rng_state = pcg(i ^ pcg(u.res.w * 2654435761u + 17u));
@@ -79,7 +80,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(workgroup_id) block:
   let old = src[i];
   var p = old.pos;
   let old_flags = old.col >> 24u;
-  let full_turn = light_steps == 0u || ((block.x + u.res.w) & (PERIOD - 1u)) == 0u;
+  let full_turn = light_steps == 0u || ((turn + u.res.w) & (PERIOD - 1u)) == 0u;
 
   if (!full_turn) {
     // Follow the surface: one gradient, one step. A particle that was on the
@@ -135,7 +136,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(workgroup_id) block:
     let key = depth_prev[pr.idx];
     if (key != 0u) {
       visible = pr.z <= key_depth(key) * (1.0 + tol);
-      crowd = f32(accum_prev[pr.idx * 4u + 3u]);
+      crowd = f32(accum_count(accum_prev[pr.idx * 2u + 1u]));
     }
   }
 
@@ -166,7 +167,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(workgroup_id) block:
       if (((donor.col >> 24u) & FLAG_VISIBLE) == 0u) { continue; }
       let dj = project(u.prev_view_proj, u.res.xy, donor.pos);
       if (!dj.ok) { continue; }
-      let there = max(f32(accum_prev[dj.idx * 4u + 3u]), 1.0);
+      let there = max(f32(accum_count(accum_prev[dj.idx * 2u + 1u])), 1.0);
       let accept = select(1.0 / there, 1.0 - (there + 1.0) / crowd, visible);
       if (rand() < accept) {
         // land near the donor, in the emptiest of a few candidate spots, so
@@ -178,7 +179,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(workgroup_id) block:
           let cand = donor.pos + rand_unit() * (reach * (0.3 + 0.7 * rand()));
           let pc = project(u.prev_view_proj, u.res.xy, cand);
           var load = 0.5;                  // off-screen: rather not
-          if (pc.ok) { load = f32(accum_prev[pc.idx * 4u + 3u]); }
+          if (pc.ok) { load = f32(accum_count(accum_prev[pc.idx * 2u + 1u])); }
           load += rand() * 0.25;
           if (load < best) { best = load; p = cand; }
         }
@@ -195,7 +196,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(workgroup_id) block:
   // normal it had then: exact for translation, a good guess for everything
   // else. In between, the particle moved along the normal only, which leaves
   // the normal it is compared against unchanged.
-  let interval = u.ages[block.x & (PERIOD - 1u)];
+  let interval = u.ages[turn & (PERIOD - 1u)];
   if (was_drawn && !moved && interval > 0.0) {
     let hh = 0.02;
     sf = scene_at(time - interval);

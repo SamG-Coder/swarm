@@ -27,6 +27,9 @@ Ray marchers pay per pixel; rasterizers need a mesh. Swarm does neither:
    - writes its depth: `atomicMax` of `1/z` per pixel, 2x2 footprint.
 2. **Splat colour** (compute). Particles on the front-most surface `atomicAdd`
    their colour and a count. The count is next frame's density feedback.
+   Atomic writes are what this pass costs, so the four sums share two words
+   per pixel: red with green, blue with the count, 16 bits each. Dense swarms
+   add fewer bits per sample (with random rounding) to keep the sums in range.
 3. **Resolve** (one fullscreen draw). Averages each pixel, fills pixels that
    have depth but no sample from same-surface neighbours, composites over sky.
 
@@ -68,9 +71,10 @@ Needs Rust and a browser with WebGPU (current Chrome, Edge or Safari; Firefox wh
     ./build.sh
     python3 -m http.server -d web 8080      # then open http://localhost:8080
 
-Controls: drag to orbit, wheel or pinch to zoom, `1` to `4` scenes, `space`
+Controls: drag to orbit, wheel or pinch to zoom, `1` to `5` scenes, `space`
 scene tour, `D` density / depth views. `?n=8000000` sets the particle budget
-(2M by default, up to 16.7M if the GPU allows 256 MB buffers).
+(2M by default, up to 64M if the GPU allows 1 GB buffers; each particle takes
+32 bytes of GPU memory).
 
 ## GitHub Pages
 
@@ -122,7 +126,9 @@ runs once per particle instead of once per distance evaluation.
   show small holes, more so at low particle counts.
 - Edges are aliased where a feature is about one pixel wide.
 - Surfaces are opaque. No transparency, reflections or global illumination.
-- Scenes are distance fields written in WGSL, not meshes.
+- Scenes are distance fields written in WGSL, not meshes. A distance estimate
+  that is only good near the surface also works (the bulb scene is one), but
+  detail finer than a pixel shows as noise.
 - Shading and visibility lag by up to three frames, which shows as a brief
   softness in fast-moving shadows and highlights.
 - Every particle still evaluates the scene a few times per frame; cost grows

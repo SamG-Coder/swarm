@@ -9,7 +9,7 @@
 struct SceneFrame {
   t: f32,
   gyroid: vec2f,              // shell half thickness, core radius
-  spin: vec2f,                // sponge: cos and sin of its rotation
+  spin: vec2f,                // sponge and bulb: cos and sin of their rotation
   balls: array<vec4f, 6>,     // metaballs: centre, radius
 };
 
@@ -82,12 +82,35 @@ fn sd_sponge(p: vec3f) -> f32 {
   return max(d * HALF, length(p) - 1.6);
 }
 
+// 4: a turning Mandelbulb of power 8. Not a true distance field: the usual
+// estimate from the escape radius and its running derivative, which is good
+// near the surface and that is where the particles are.
+fn sd_bulb(p: vec3f) -> f32 {
+  const SIZE = 1.3;
+  let c = vec3f(sf.spin.x * p.x + sf.spin.y * p.z, p.y, sf.spin.x * p.z - sf.spin.y * p.x) / SIZE;
+  var z = c;
+  var dr = 1.0;
+  var r = max(length(z), 1e-6);
+  for (var i = 0; i < 5; i++) {
+    if (r > 2.0) { break; }
+    let theta = acos(clamp(z.y / r, -1.0, 1.0)) * 8.0;
+    let phi = atan2(z.z, z.x) * 8.0;
+    let r2 = r * r;
+    let r7 = r2 * r2 * r2 * r;
+    dr = r7 * 8.0 * dr + 1.0;
+    z = r7 * r * vec3f(sin(theta) * cos(phi), cos(theta), sin(theta) * sin(phi)) + c;
+    r = max(length(z), 1e-6);
+  }
+  return 0.5 * log(r) * r / dr * SIZE;
+}
+
 fn scene_sdf(id: u32, p: vec3f) -> f32 {
   switch id {
     case 0u { return sd_gyroid_orb(p); }
     case 1u { return sd_metaballs(p); }
     case 2u { return sd_ribbon(p); }
-    default { return sd_sponge(p); }
+    case 3u { return sd_sponge(p); }
+    default { return sd_bulb(p); }
   }
 }
 
@@ -154,9 +177,14 @@ fn scene_albedo(id: u32, p: vec3f) -> vec3f {
                          vec3f(1.0, 1.0, 2.0), vec3f(0.55, 0.30, 0.10));
       return mix(vec3f(0.92, 0.88, 0.82), band, smoothstep(0.55, 0.75, length(p)));
     }
-    default {
+    case 3u {
       // terracotta outside, teal deep inside the holes
       return mix(vec3f(0.22, 0.50, 0.56), vec3f(0.80, 0.46, 0.32), smoothstep(0.45, 1.25, length(p)));
+    }
+    default {
+      // bands by distance from the centre: gold on the buds, violet in the folds
+      return palette(length(p) * 1.1, vec3f(0.55, 0.47, 0.50), vec3f(0.38, 0.30, 0.34),
+                     vec3f(1.0, 1.0, 1.0), vec3f(0.10, 0.22, 0.48));
     }
   }
 }

@@ -23,6 +23,7 @@ pub const OP_COMPUTE_PASS: u32 = 9; // pipeline, bind group, workgroups
 pub const OP_RENDER_PASS: u32 = 10; // pipeline, bind group, vertex count (to the canvas)
 pub const OP_SUBMIT: u32 = 11;
 pub const OP_HUD: u32 = 12; // text
+pub const OP_COMPUTE_PASS_ROWS: u32 = 13; // pipeline, bind group, workgroups x, workgroups y
 
 /// WebGPU `GPUBufferUsage` flags.
 pub mod usage {
@@ -127,9 +128,19 @@ impl CommandStream {
         self.words.extend([OP_CLEAR_BUFFER, buffer.0]);
     }
 
-    pub fn compute_pass(&mut self, pipeline: Id, bind_group: Id, workgroups: u32) {
-        self.words
-            .extend([OP_COMPUTE_PASS, pipeline.0, bind_group.0, workgroups]);
+    /// `workgroups` is the dispatch size in x and y. A single row uses the
+    /// original one-dimensional command, so a host that predates
+    /// `OP_COMPUTE_PASS_ROWS` (a cached script, say) still runs every swarm
+    /// that fits in one.
+    pub fn compute_pass(&mut self, pipeline: Id, bind_group: Id, workgroups: (u32, u32)) {
+        let (x, y) = workgroups;
+        if y == 1 {
+            self.words
+                .extend([OP_COMPUTE_PASS, pipeline.0, bind_group.0, x]);
+        } else {
+            self.words
+                .extend([OP_COMPUTE_PASS_ROWS, pipeline.0, bind_group.0, x, y]);
+        }
     }
 
     pub fn render_pass(&mut self, pipeline: Id, bind_group: Id, vertices: u32) {

@@ -14,7 +14,7 @@ struct Uniforms {
   cam_fwd: vec4f,           // xyz, debug mode
   tune: vec4f,              // turnover, respawn rate, restart rate, depth tolerance
   ages: vec4f,              // seconds since the last full turn, by block index mod 4
-  pace: vec4f,              // Newton steps on a light turn (0: no light turns), unused
+  pace: vec4f,              // Newton steps on a light turn (0: no light turns), colour shift
 };
 
 struct Particle {
@@ -84,3 +84,15 @@ fn drawable(p: Particle) -> bool {
 
 fn depth_key(z: f32) -> u32 { return bitcast<u32>(1.0 / z); }
 fn key_depth(k: u32) -> f32 { return 1.0 / bitcast<f32>(k); }
+
+// The accumulation buffer holds two words per pixel, each split into two
+// 16-bit fields: red and green sums in the first, blue sum and sample count in
+// the second. A particle then needs two atomic adds instead of four. To keep
+// the sums inside their fields where particles pile up, each sample drops
+// `u.pace.y` low bits first (see `colour_shift` in renderer.rs).
+fn accum_count(second: u32) -> u32 { return second >> 16u; }
+
+// The most samples a pixel can take before its colour sums overflow. The
+// density feedback keeps nearly every pixel far below it; the few that go
+// over still count correctly but have lost their colour.
+fn accum_room() -> u32 { return 65535u / ((255u >> u32(u.pace.y)) + 1u); }

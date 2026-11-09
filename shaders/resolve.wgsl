@@ -17,6 +17,14 @@ fn heat(t: f32) -> vec3f {
   return clamp(vec3f(1.5 * x, 1.6 * x * (1.4 - x), 1.2 * (1.0 - x) * (0.25 + x)) + 0.02, vec3f(0.0), vec3f(1.0));
 }
 
+// Mean colour of a pixel's samples, given its second accumulation word.
+fn pixel_rgb(idx: u32, second: u32) -> vec3f {
+  let first = accum[idx * 2u];
+  let sums = vec3f(f32(first & 0xffffu), f32(first >> 16u), f32(second & 0xffffu));
+  // each sample was shifted down by u.pace.y bits before it was added
+  return sums * (exp2(u.pace.y) / (255.0 * f32(accum_count(second))));
+}
+
 @fragment
 fn fs(@builtin(position) frag: vec4f) -> @location(0) vec4f {
   let res = vec2i(u.res.xy);
@@ -26,11 +34,16 @@ fn fs(@builtin(position) frag: vec4f) -> @location(0) vec4f {
 
   let own_idx = u32(pix.y * res.x + pix.x);
   let own_key = depth[own_idx];
-  let own_count = accum[own_idx * 4u + 3u];
+  let own_word = accum[own_idx * 2u + 1u];
+  let own_count = accum_count(own_word);
+  // a pixel with more samples than its sums can hold is treated as having
+  // none: it takes its colour from its neighbours instead
+  let room = accum_room();
+  let own_sampled = own_count > 0u && own_count <= room;
 
   // background: only pixels without a sample of their own can show it
   var back = vec3f(0.0);
-  if (own_count == 0u) {
+  if (!own_sampled) {
     let ndc = vec2f((f32(pix.x) + 0.5) / f32(res.x) * 2.0 - 1.0, 1.0 - (f32(pix.y) + 0.5) / f32(res.y) * 2.0);
     let tanf = u.cam_right.w;
     let dir = normalize(u.cam_fwd.xyz + u.cam_right.xyz * (ndc.x * tanf * f32(res.x) / f32(res.y)) + u.cam_up.xyz * (ndc.y * tanf));
@@ -62,7 +75,7 @@ fn fs(@builtin(position) frag: vec4f) -> @location(0) vec4f {
   var n5 = 0.0;
   var n_front = 0.0;
   var ring = 2;
-  if (own_count > 0u) { ring = 1; }
+  if (own_sampled) { ring = 1; }
   if (zref > 1e29) { ring = -1; }
   for (var dy = -ring; dy <= ring; dy++) {
     for (var dx = -ring; dx <= ring; dx++) {
@@ -70,10 +83,11 @@ fn fs(@builtin(position) frag: vec4f) -> @location(0) vec4f {
       let q = pix + vec2i(dx, dy);
       if (q.x < 0 || q.y < 0 || q.x >= res.x || q.y >= res.y) { continue; }
       let idx = u32(q.y * res.x + q.x);
-      let cnt = f32(accum[idx * 4u + 3u]);
-      if (cnt == 0.0) { continue; }
+      let word = accum[idx * 2u + 1u];
+      let cnt = accum_count(word);
+      if (cnt == 0u || cnt > room) { continue; }
       let z = key_depth(depth[idx]);
-      let c = vec3f(f32(accum[idx * 4u]), f32(accum[idx * 4u + 1u]), f32(accum[idx * 4u + 2u])) / (cnt * 255.0);
+      let c = pixel_rgb(idx, word);
       let w = exp(-0.45 * f32(dx * dx + dy * dy));
       let inner = abs(dx) <= 1 && abs(dy) <= 1;
       if (abs(z - zref) <= zref * tol) {
@@ -89,13 +103,13 @@ fn fs(@builtin(position) frag: vec4f) -> @location(0) vec4f {
 
   var color = back;
   var z_out = 1e30;
-  if (own_count > 0u) {
+  if (own_sampled) {
     if (n_front >= 5.0) {
       // a far surface peeking through a pinhole in a nearer one
       color = front.rgb / front.w;
     } else {
       // a real sample: keep it, lightly filtered with same-surface neighbours
-      let own = vec3f(f32(accum[own_idx * 4u]), f32(accum[own_idx * 4u + 1u]), f32(accum[own_idx * 4u + 2u])) / (f32(own_count) * 255.0);
+      let own = pixel_rgb(own_idx, own_word);
       color = (own * 2.0 + same3.rgb) / (2.0 + same3.w);
     }
     z_out = zref;

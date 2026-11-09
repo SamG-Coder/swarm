@@ -9,7 +9,8 @@
 //!                (atomicMax of 1/z per pixel). Only one block of particles
 //!                in `PERIOD` does all of that in a given frame; the others
 //!                just follow their surface (see `simulate.wgsl`)
-//!   splat color  atomicAdd of colour + count for particles on the front surface
+//!   splat color  atomicAdd of colour + count for particles on the front
+//!                surface, packed into two words per pixel
 //!   resolve      fullscreen pass: average, close pinholes, composite over sky
 //!
 //! There are two depth buffers, swapped every frame like the particle buffers,
@@ -48,12 +49,41 @@ pub struct Pace {
     /// (block index modulo `PERIOD`).
     pub ages: [f32; PERIOD as usize],
 }
-pub const SCENE_COUNT: u32 = 4;
+
+pub const SCENE_COUNT: u32 = 5;
 pub const SCENE_NAMES: [&str; SCENE_COUNT as usize] =
-    ["gyroid orb", "metaballs", "ribbon", "sponge"];
+    ["gyroid orb", "metaballs", "ribbon", "sponge", "bulb"];
 const MIN_PARTICLES: u32 = 32 * 1024;
-/// As many as one dispatch can cover: WebGPU guarantees 65535 workgroups.
-const MAX_PARTICLES: u32 = 65_535 * WORKGROUP;
+/// 1 GiB per particle buffer. The host asks the GPU for buffers that large
+/// and passes a smaller budget if it cannot have them.
+const MAX_PARTICLES: u32 = 64 * 1024 * 1024;
+/// WebGPU only guarantees 65535 workgroups per dimension, so large swarms are
+/// dispatched as rows of this many workgroups (see `dispatch_size`).
+pub const ROW_GROUPS: u32 = 32_768;
+
+/// Workgroup counts (x, y) that cover `particles`. Rows are always full
+/// except when there is only one, so the shaders can find a particle's index
+/// from its row and column.
+fn dispatch_size(particles: u32) -> (u32, u32) {
+    let groups = particles.div_ceil(WORKGROUP);
+    if groups <= ROW_GROUPS {
+        (groups, 1)
+    } else {
+        (ROW_GROUPS, groups.div_ceil(ROW_GROUPS))
+    }
+}
+
+/// Pass 2 adds each colour channel into a 16-bit field per pixel, which must
+/// not overflow where particles pile up. Dense swarms therefore add fewer
+/// bits per sample: this many are dropped, with random rounding so nothing is
+/// lost on average. Leaves room for 64 times the mean density.
+fn colour_shift(particles: u32, pixels: u32) -> u32 {
+    let per_pixel = particles as f32 / pixels.max(1) as f32;
+    let room = |shift: u32| 65_535 / ((255 >> shift) + 1);
+    (0..7)
+        .find(|&shift| room(shift) as f32 >= 64.0 * per_pixel)
+        .unwrap_or(7)
+}
 
 /// Tunables of the feedback loop (see `simulate.wgsl`). The rates are per
 /// frame; the shader gets them as the chance per full turn.
@@ -147,13 +177,14 @@ impl Renderer {
             cmds.create_buffer(particle_bytes, usage::STORAGE | usage::COPY_DST),
         ];
 
-        let period = format!("const PERIOD: u32 = {PERIOD}u;\n");
-        let s_simulate = cmds.create_shader(&[&period, COMMON, SCENE, SIMULATE].concat());
-
-        let s_splat_color = cmds.create_shader(&[COMMON, SPLAT_COLOR].concat());
+        let consts = format!(
+            "const PERIOD: u32 = {PERIOD}u;\nconst ROW: u32 = {}u;\n",
+            ROW_GROUPS * WORKGROUP
+        );
+        let s_simulate = cmds.create_shader(&[&consts, COMMON, SCENE, SIMULATE].concat());
+        let s_splat_color = cmds.create_shader(&[&consts, COMMON, SPLAT_COLOR].concat());
         let s_resolve = cmds.create_shader(&[COMMON, SCENE, RESOLVE].concat());
         let p_simulate = cmds.create_compute_pipeline(s_simulate, "main");
-
         let p_splat_color = cmds.create_compute_pipeline(s_splat_color, "main");
         let p_resolve = cmds.create_render_pipeline(s_resolve, "vs", "fs");
 
@@ -204,7 +235,7 @@ impl Renderer {
             self.cmds.create_buffer(pixels * 4, store),
             self.cmds.create_buffer(pixels * 4, store),
         ];
-        let accum = self.cmds.create_buffer(pixels * 16, store);
+        let accum = self.cmds.create_buffer(pixels * 8, store);
         let (u, p) = (self.uniforms, self.particles);
         let (ps, pc, pr) = (self.p_simulate, self.p_splat_color, self.p_resolve);
         let c = &mut self.cmds;
@@ -449,7 +480,12 @@ impl Renderer {
                 t.depth_tolerance,
             ],
             pace.ages,
-            [pace.light_steps as f32, 0.0, 0.0, 0.0],
+            [
+                pace.light_steps as f32,
+                colour_shift(active, self.width * self.height) as f32,
+                0.0,
+                0.0,
+            ],
         ];
         for v in floats.into_iter().flatten() {
             put(v.to_le_bytes());
@@ -471,7 +507,7 @@ impl Renderer {
         } else {
             self.active
         };
-        let groups = count.div_ceil(WORKGROUP);
+        let groups = dispatch_size(count);
         let (src, dst) = (self.flip, 1 - self.flip);
 
         let s = &self.sized;
@@ -569,6 +605,7 @@ mod tests {
         assert!((f32_at(252) - r.tuning.depth_tolerance).abs() < 1e-6); // tune.w
         assert_eq!((f32_at(256), f32_at(268)), (0.1, 0.4)); // ages
         assert_eq!(f32_at(272), 2.0); // pace.x = light steps
+        assert_eq!(f32_at(276), 0.0); // pace.y = colour shift: a sparse swarm keeps all 8 bits
 
         // with a full turn every frame the rates are per frame again
         pace.light_steps = 0;
@@ -665,8 +702,57 @@ mod tests {
     fn the_largest_swarm_fits_one_dispatch_and_one_buffer() {
         let r = Renderer::new(64, 64, u32::MAX);
         assert_eq!(r.active_particles(), MAX_PARTICLES);
-        assert!(MAX_PARTICLES / WORKGROUP <= 65_535);
         assert!(MAX_PARTICLES.checked_mul(PARTICLE_BYTES).is_some());
+        let (x, y) = dispatch_size(MAX_PARTICLES);
+        assert!(x <= 65_535 && y <= 65_535);
+        assert!(x * y * WORKGROUP >= MAX_PARTICLES);
+    }
+
+    #[test]
+    fn dispatch_rows_are_full_so_indices_stay_contiguous() {
+        assert_eq!(dispatch_size(WORKGROUP), (1, 1));
+        assert_eq!(dispatch_size(WORKGROUP + 1), (2, 1));
+        assert_eq!(dispatch_size(ROW_GROUPS * WORKGROUP), (ROW_GROUPS, 1));
+        assert_eq!(dispatch_size(ROW_GROUPS * WORKGROUP + 1), (ROW_GROUPS, 2));
+        assert_eq!(
+            dispatch_size(5 * ROW_GROUPS * WORKGROUP / 2),
+            (ROW_GROUPS, 3)
+        );
+    }
+
+    #[test]
+    fn only_multi_row_swarms_use_the_newer_dispatch_command() {
+        let passes = |particles: u32| {
+            let mut r = Renderer::new(64, 64, particles);
+            r.cmds.clear();
+            r.frame(0.0);
+            let w = r.cmds.words().to_vec();
+            let sim = 4 + UNIFORM_BYTES / 4 + 2;
+            (w[sim], w[sim + 3], w[sim + 4])
+        };
+        let one_row = ROW_GROUPS * WORKGROUP;
+        assert_eq!(
+            passes(one_row),
+            (OP_COMPUTE_PASS, ROW_GROUPS, OP_CLEAR_BUFFER)
+        );
+        assert_eq!(passes(2 * one_row), (OP_COMPUTE_PASS_ROWS, ROW_GROUPS, 2));
+    }
+
+    #[test]
+    fn dense_swarms_add_fewer_colour_bits() {
+        let pixels = 1920 * 1080;
+        assert_eq!(colour_shift(2 * 1024 * 1024, pixels), 0);
+        assert!(colour_shift(16 * 1024 * 1024, pixels) > 0);
+        // the 16-bit fields hold 64 times the mean density at every size
+        for particles in [32 * 1024, 1 << 20, 1 << 24, MAX_PARTICLES] {
+            for pixels in [320 * 200, 1280 * 720, pixels, 3840 * 2160] {
+                let shift = colour_shift(particles, pixels);
+                let most = (255 >> shift) + 1; // largest value one sample adds
+                let mean = particles as f32 / pixels as f32;
+                assert!(shift == 7 || (65_535 / most) as f32 >= 64.0 * mean);
+                assert!(shift <= 7);
+            }
+        }
     }
 
     #[test]

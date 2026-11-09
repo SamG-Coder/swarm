@@ -4,7 +4,7 @@
 const OP = {
   CREATE_BUFFER: 1, WRITE_BUFFER: 2, CREATE_SHADER: 3, CREATE_COMPUTE_PIPELINE: 4,
   CREATE_RENDER_PIPELINE: 5, CREATE_BIND_GROUP: 6, DESTROY: 7, CLEAR_BUFFER: 8,
-  COMPUTE_PASS: 9, RENDER_PASS: 10, SUBMIT: 11, HUD: 12,
+  COMPUTE_PASS: 9, RENDER_PASS: 10, SUBMIT: 11, HUD: 12, COMPUTE_PASS_ROWS: 13,
 };
 
 export class Host {
@@ -93,12 +93,13 @@ export class Host {
         case OP.CLEAR_BUFFER:
           encoder().clearBuffer(get());
           break;
-        case OP.COMPUTE_PASS: {
-          const pipeline = get(), bindGroup = get(), groups = next();
+        case OP.COMPUTE_PASS:
+        case OP.COMPUTE_PASS_ROWS: {
+          const pipeline = get(), bindGroup = get(), x = next(), y = op === OP.COMPUTE_PASS_ROWS ? next() : 1;
           const pass = encoder().beginComputePass();
           pass.setPipeline(pipeline);
           pass.setBindGroup(0, bindGroup);
-          pass.dispatchWorkgroups(groups);
+          pass.dispatchWorkgroups(x, y);
           pass.end();
           break;
         }
