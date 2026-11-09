@@ -1,0 +1,20 @@
+[package]
+name = "swarm"
+version = "0.1.0"
+edition = "2021"
+description = "Swarm: a feedback-driven point-swarm renderer for implicit surfaces (Rust + WebGPU)"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# No dependencies on purpose: the Rust core talks to WebGPU through a compact
+# command stream that a ~200 line JS host executes (see src/cmd.rs, web/host.js).
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

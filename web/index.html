@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Swarm</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0d12; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; height: 100dvh; touch-action: none; cursor: grab; }
+  canvas:active { cursor: grabbing; }
+  .ui { position: fixed; left: 0; right: 0; padding: 12px 14px; color: #e8ebf2; pointer-events: none;
+        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: .02em;
+        text-shadow: 0 1px 2px rgba(0, 0, 0, .7); }
+  #top { top: env(safe-area-inset-top); display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+  #top b { font-weight: 600; letter-spacing: .28em; }
+  #hud { opacity: .8; }
+  #bar { bottom: env(safe-area-inset-bottom); display: flex; gap: 8px; flex-wrap: wrap; }
+  button { pointer-events: auto; font: inherit; color: inherit; background: rgba(16, 19, 28, .55);
+           border: 1px solid rgba(232, 235, 242, .28); border-radius: 6px; padding: 8px 12px; min-width: 40px;
+           -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); cursor: pointer; }
+  button:hover { border-color: rgba(232, 235, 242, .7); }
+  button:focus-visible { outline: 2px solid #9ec1ff; outline-offset: 2px; }
+  #error { position: fixed; inset: 0; display: none; place-items: center; padding: 32px; text-align: center;
+           color: #e8ebf2; font: 15px/1.6 system-ui, sans-serif; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div class="ui" id="top"><b>SWARM</b><span id="hud">starting</span></div>
+<div class="ui" id="bar">
+  <button data-scene="0" title="Key 1">Gyroid</button>
+  <button data-scene="1" title="Key 2">Metaballs</button>
+  <button data-scene="2" title="Key 3">Ribbon</button>
+  <button id="tour" title="Space">Tour</button>
+  <button id="debug" title="Key D">Density view</button>
+</div>
+<div id="error"></div>
+<script type="module" src="main.js"></script>
+</body>
+</html>
