@@ -1,7 +1,8 @@
 // Swarm bootstrap: sets up WebGPU, loads the Rust core (swarm.wasm) and pumps
 // one frame of commands per animation frame.
 //
-//   ?n=2000000      particle budget (default 1M desktop, 400k touch devices)
+//   ?n=8000000      particle budget (default 2M desktop, 600k touch devices,
+//                   up to 16.7M where the GPU allows buffers that large)
 //   ?trace=file.bin replay a command trace recorded by `cargo run --bin trace`
 
 import { Host } from './host.js';
@@ -9,6 +10,7 @@ import { Host } from './host.js';
 const canvas = document.getElementById('view');
 const hud = document.getElementById('hud');
 const params = new URLSearchParams(location.search);
+const MAX_PARTICLE_BYTES = 268_435_456;   // 16.7M particles: the most the core will run
 
 function fail(message) {
   const el = document.getElementById('error');
@@ -32,7 +34,15 @@ async function main() {
   if (!navigator.gpu) fail('This browser does not support WebGPU.\nTry a current Chrome, Edge, Safari or Firefox.');
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) fail('No WebGPU adapter is available on this device.');
-  const device = await adapter.requestDevice();
+  // Particles live in one storage buffer of 16 bytes each. The default limit
+  // on a buffer binding (128 MB) would cap the swarm at 8M, so ask for as much
+  // as the largest swarm needs, or as much as this adapter has.
+  const device = await adapter.requestDevice({
+    requiredLimits: {
+      maxStorageBufferBindingSize: Math.min(adapter.limits.maxStorageBufferBindingSize, MAX_PARTICLE_BYTES),
+      maxBufferSize: Math.min(adapter.limits.maxBufferSize, MAX_PARTICLE_BYTES),
+    },
+  });
   device.addEventListener('uncapturederror', (e) => {
     console.error(e.error.message);
     window.__error = e.error.message;
@@ -50,8 +60,8 @@ async function main() {
   const host = new Host(device, context, format, hudText);
 
   const touch = matchMedia('(pointer: coarse)').matches;
-  const limit = Math.floor(device.limits.maxStorageBufferBindingSize / 16);
-  const particles = Math.min(Number(params.get('n')) || (touch ? 400_000 : 1_048_576), limit);
+  const limit = Math.floor(Math.min(device.limits.maxStorageBufferBindingSize, device.limits.maxBufferSize) / 16);
+  const particles = Math.min(Number(params.get('n')) || (touch ? 600_000 : 2_097_152), limit);
 
   let wasm;
   try {
@@ -125,7 +135,7 @@ function bindInput(wasm) {
   document.getElementById('tour').addEventListener('click', () => wasm.swarm_toggle_auto_cycle());
   document.getElementById('debug').addEventListener('click', () => wasm.swarm_cycle_debug());
   addEventListener('keydown', (e) => {
-    if (e.key >= '1' && e.key <= '3') wasm.swarm_set_scene(Number(e.key) - 1);
+    if (e.key >= '1' && e.key <= '4') wasm.swarm_set_scene(Number(e.key) - 1);
     else if (e.key === ' ') { e.preventDefault(); wasm.swarm_toggle_auto_cycle(); }
     else if (e.key === 'd' || e.key === 'D') wasm.swarm_cycle_debug();
   });

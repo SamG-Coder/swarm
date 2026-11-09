@@ -13,6 +13,8 @@ struct Uniforms {
   cam_up: vec4f,            // xyz, seconds since the previous frame
   cam_fwd: vec4f,           // xyz, debug mode
   tune: vec4f,              // turnover, respawn rate, restart rate, depth tolerance
+  ages: vec4f,              // seconds since the last full turn, by block index mod 4
+  pace: vec4f,              // Newton steps on a light turn (0: no light turns), unused
 };
 
 struct Particle {

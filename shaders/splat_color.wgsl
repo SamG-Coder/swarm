@@ -1,5 +1,6 @@
-// Pass 3 - colour splat. Every particle on the front-most surface of its pixel
+// Pass 2 - colour splat. Every particle on the front-most surface of its pixel
 // adds its colour; the per-pixel count doubles as next frame's density feedback.
+// The depth buffer it tests against was written by the simulation pass.
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read> particles: array<Particle>;

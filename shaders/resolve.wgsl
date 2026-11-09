@@ -1,4 +1,4 @@
-// Pass 4 - resolve. Turns the splat buffers into the final image: averages the
+// Pass 3 - resolve. Turns the splat buffers into the final image: averages the
 // samples in each pixel, closes pinholes from neighbours at matching depth,
 // and composites over the sky.
 
@@ -24,15 +24,18 @@ fn fs(@builtin(position) frag: vec4f) -> @location(0) vec4f {
   let tol = u.tune.w * 3.0;
   let debug = u32(u.cam_fwd.w);
 
-  // background
-  let ndc = vec2f((f32(pix.x) + 0.5) / f32(res.x) * 2.0 - 1.0, 1.0 - (f32(pix.y) + 0.5) / f32(res.y) * 2.0);
-  let tanf = u.cam_right.w;
-  let dir = normalize(u.cam_fwd.xyz + u.cam_right.xyz * (ndc.x * tanf * f32(res.x) / f32(res.y)) + u.cam_up.xyz * (ndc.y * tanf));
-  let back = pow(clamp(sky(dir), vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2));
-
   let own_idx = u32(pix.y * res.x + pix.x);
   let own_key = depth[own_idx];
   let own_count = accum[own_idx * 4u + 3u];
+
+  // background: only pixels without a sample of their own can show it
+  var back = vec3f(0.0);
+  if (own_count == 0u) {
+    let ndc = vec2f((f32(pix.x) + 0.5) / f32(res.x) * 2.0 - 1.0, 1.0 - (f32(pix.y) + 0.5) / f32(res.y) * 2.0);
+    let tanf = u.cam_right.w;
+    let dir = normalize(u.cam_fwd.xyz + u.cam_right.xyz * (ndc.x * tanf * f32(res.x) / f32(res.y)) + u.cam_up.xyz * (ndc.y * tanf));
+    back = pow(clamp(sky(dir), vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2));
+  }
 
   // reference depth: this pixel's surface, or the nearest one around it
   var zref = 1e30;
@@ -50,14 +53,19 @@ fn fs(@builtin(position) frag: vec4f) -> @location(0) vec4f {
   }
 
   // gather coloured neighbours: on the same surface (3x3 and 5x5), and on a
-  // surface clearly in front of this pixel (3x3)
+  // surface clearly in front of this pixel (3x3). A pixel with a sample of
+  // its own only uses the 3x3 ring, and one with no depth anywhere around it
+  // is plain sky and gathers nothing.
   var same3 = vec4f(0.0);   // rgb * weight, weight
   var same5 = vec4f(0.0);
   var front = vec4f(0.0);
   var n5 = 0.0;
   var n_front = 0.0;
-  for (var dy = -2; dy <= 2; dy++) {
-    for (var dx = -2; dx <= 2; dx++) {
+  var ring = 2;
+  if (own_count > 0u) { ring = 1; }
+  if (zref > 1e29) { ring = -1; }
+  for (var dy = -ring; dy <= ring; dy++) {
+    for (var dx = -ring; dx <= ring; dx++) {
       if (dx == 0 && dy == 0) { continue; }
       let q = pix + vec2i(dx, dy);
       if (q.x < 0 || q.y < 0 || q.x >= res.x || q.y >= res.y) { continue; }

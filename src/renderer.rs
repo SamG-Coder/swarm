@@ -5,11 +5,15 @@
 //!
 //!   simulate     particles read LAST frame's depth + density buffers, migrate
 //!                towards under-sampled visible surface, re-project onto the
-//!                SDF and shade themselves
-//!   clear        depth + accumulation buffers
-//!   splat depth  atomicMax of 1/z per pixel
+//!                SDF, shade themselves and write THIS frame's depth
+//!                (atomicMax of 1/z per pixel). Only one block of particles
+//!                in `PERIOD` does all of that in a given frame; the others
+//!                just follow their surface (see `simulate.wgsl`)
 //!   splat color  atomicAdd of colour + count for particles on the front surface
 //!   resolve      fullscreen pass: average, close pinholes, composite over sky
+//!
+//! There are two depth buffers, swapped every frame like the particle buffers,
+//! so the simulation can read the old one while it fills the new one.
 
 use crate::camera::Camera;
 use crate::cmd::{usage, CommandStream, Id};
@@ -18,19 +22,41 @@ use crate::math::{vec3, Mat4};
 const COMMON: &str = include_str!("../shaders/common.wgsl");
 const SCENE: &str = include_str!("../shaders/scene.wgsl");
 const SIMULATE: &str = include_str!("../shaders/simulate.wgsl");
-const SPLAT_DEPTH: &str = include_str!("../shaders/splat_depth.wgsl");
 const SPLAT_COLOR: &str = include_str!("../shaders/splat_color.wgsl");
 const RESOLVE: &str = include_str!("../shaders/resolve.wgsl");
 
-pub const UNIFORM_BYTES: usize = 256;
+pub const UNIFORM_BYTES: usize = 288;
 pub const PARTICLE_BYTES: u32 = 16;
 pub const WORKGROUP: u32 = 256;
-pub const SCENE_COUNT: u32 = 3;
-pub const SCENE_NAMES: [&str; SCENE_COUNT as usize] = ["gyroid orb", "metaballs", "ribbon"];
-const MIN_PARTICLES: u32 = 32 * 1024;
-const MAX_PARTICLES: u32 = 4 * 1024 * 1024;
+/// A particle gets a full turn (feedback, migration, tracking, shading) once
+/// in this many frames, and a cheap surface-following step in the others.
+/// A power of two.
+pub const PERIOD: u32 = 4;
+// the shader gets one age per class of blocks in a vec4
+const _: () = assert!(PERIOD == 4);
 
-/// Tunables of the feedback loop (see `simulate.wgsl`).
+/// How the swarm spends one frame (see `simulate.wgsl`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pace {
+    /// Seconds since the previous frame, at most 0.1.
+    pub dt: f32,
+    /// Newton steps for a particle that is only following its surface: more
+    /// when frames are far apart. 0 means they are too far apart for that and
+    /// every particle takes a full turn, every frame.
+    pub light_steps: u32,
+    /// Seconds since the last full turn of each class of blocks
+    /// (block index modulo `PERIOD`).
+    pub ages: [f32; PERIOD as usize],
+}
+pub const SCENE_COUNT: u32 = 4;
+pub const SCENE_NAMES: [&str; SCENE_COUNT as usize] =
+    ["gyroid orb", "metaballs", "ribbon", "sponge"];
+const MIN_PARTICLES: u32 = 32 * 1024;
+/// As many as one dispatch can cover: WebGPU guarantees 65535 workgroups.
+const MAX_PARTICLES: u32 = 65_535 * WORKGROUP;
+
+/// Tunables of the feedback loop (see `simulate.wgsl`). The rates are per
+/// frame; the shader gets them as the chance per full turn.
 #[derive(Clone, Copy, Debug)]
 pub struct Tuning {
     /// Chance per frame that a visible particle in a crowded pixel looks for
@@ -59,12 +85,11 @@ impl Default for Tuning {
 }
 
 struct SizeDependent {
-    depth: Id,
+    depth: [Id; 2],
     accum: Id,
     simulate: [Id; 2],
-    splat_depth: [Id; 2],
     splat_color: [Id; 2],
-    resolve: Id,
+    resolve: [Id; 2],
 }
 
 pub struct Renderer {
@@ -83,7 +108,6 @@ pub struct Renderer {
     uniforms: Id,
     particles: [Id; 2],
     p_simulate: Id,
-    p_splat_depth: Id,
     p_splat_color: Id,
     p_resolve: Id,
     sized: SizeDependent,
@@ -94,6 +118,8 @@ pub struct Renderer {
 
     time: f64,
     last_time: Option<f64>,
+    /// When each class of blocks last had a full turn.
+    turn_time: [f64; PERIOD as usize],
     frame_ms: f32,
     idle: f32,
 
@@ -121,12 +147,13 @@ impl Renderer {
             cmds.create_buffer(particle_bytes, usage::STORAGE | usage::COPY_DST),
         ];
 
-        let s_simulate = cmds.create_shader(&[COMMON, SCENE, SIMULATE].concat());
-        let s_splat_depth = cmds.create_shader(&[COMMON, SPLAT_DEPTH].concat());
+        let period = format!("const PERIOD: u32 = {PERIOD}u;\n");
+        let s_simulate = cmds.create_shader(&[&period, COMMON, SCENE, SIMULATE].concat());
+
         let s_splat_color = cmds.create_shader(&[COMMON, SPLAT_COLOR].concat());
         let s_resolve = cmds.create_shader(&[COMMON, SCENE, RESOLVE].concat());
         let p_simulate = cmds.create_compute_pipeline(s_simulate, "main");
-        let p_splat_depth = cmds.create_compute_pipeline(s_splat_depth, "main");
+
         let p_splat_color = cmds.create_compute_pipeline(s_splat_color, "main");
         let p_resolve = cmds.create_render_pipeline(s_resolve, "vs", "fs");
 
@@ -143,22 +170,21 @@ impl Renderer {
             uniforms,
             particles,
             p_simulate,
-            p_splat_depth,
             p_splat_color,
             p_resolve,
             sized: SizeDependent {
-                depth: Id(0),
+                depth: [Id(0); 2],
                 accum: Id(0),
                 simulate: [Id(0); 2],
-                splat_depth: [Id(0); 2],
                 splat_color: [Id(0); 2],
-                resolve: Id(0),
+                resolve: [Id(0); 2],
             },
             frame: 0,
             flip: 0,
             prev_view_proj: None,
             time: 0.0,
             last_time: None,
+            turn_time: [0.0; PERIOD as usize],
             frame_ms: 16.7,
             idle: 1e9,
             scene_a: 0,
@@ -174,30 +200,36 @@ impl Renderer {
     fn create_size_dependent(&mut self) -> SizeDependent {
         let pixels = self.width * self.height;
         let store = usage::STORAGE | usage::COPY_DST;
-        let depth = self.cmds.create_buffer(pixels * 4, store);
+        let depth = [
+            self.cmds.create_buffer(pixels * 4, store),
+            self.cmds.create_buffer(pixels * 4, store),
+        ];
         let accum = self.cmds.create_buffer(pixels * 16, store);
         let (u, p) = (self.uniforms, self.particles);
-        let (ps, pd, pc) = (self.p_simulate, self.p_splat_depth, self.p_splat_color);
+        let (ps, pc, pr) = (self.p_simulate, self.p_splat_color, self.p_resolve);
         let c = &mut self.cmds;
-        // index = which particle buffer is read ("src") by simulate
+        // index = which particle and depth buffers simulate reads ("src");
+        // it writes the other of each pair
         let simulate = [0, 1].map(|i| {
-            c.create_bind_group(
-                ps,
-                0,
-                &[(0, u), (1, p[i]), (2, p[1 - i]), (3, depth), (4, accum)],
-            )
+            let entries = [
+                (0, u),
+                (1, p[i]),
+                (2, p[1 - i]),
+                (3, depth[i]),
+                (4, accum),
+                (5, depth[1 - i]),
+            ];
+            c.create_bind_group(ps, 0, &entries)
         });
-        // index = which particle buffer is splatted
-        let splat_depth =
-            [0, 1].map(|i| c.create_bind_group(pd, 0, &[(0, u), (1, p[i]), (2, depth)]));
+        // index = which particle and depth buffers hold the current frame
         let splat_color = [0, 1]
-            .map(|i| c.create_bind_group(pc, 0, &[(0, u), (1, p[i]), (2, depth), (3, accum)]));
-        let resolve = c.create_bind_group(self.p_resolve, 0, &[(0, u), (1, depth), (2, accum)]);
+            .map(|i| c.create_bind_group(pc, 0, &[(0, u), (1, p[i]), (2, depth[i]), (3, accum)]));
+        let resolve =
+            [0, 1].map(|i| c.create_bind_group(pr, 0, &[(0, u), (1, depth[i]), (2, accum)]));
         SizeDependent {
             depth,
             accum,
             simulate,
-            splat_depth,
             splat_color,
             resolve,
         }
@@ -217,12 +249,13 @@ impl Renderer {
             return;
         }
         let s = &self.sized;
-        let mut stale = vec![s.resolve, s.depth, s.accum];
+        let mut stale = vec![s.accum];
         stale.extend(
-            s.simulate
+            s.depth
                 .iter()
-                .chain(&s.splat_depth)
-                .chain(&s.splat_color),
+                .chain(&s.simulate)
+                .chain(&s.splat_color)
+                .chain(&s.resolve),
         );
         for id in stale {
             self.cmds.destroy(id);
@@ -280,11 +313,13 @@ impl Renderer {
 
     // --- per frame -----------------------------------------------------------
 
-    fn advance(&mut self, time: f64) -> f32 {
-        let dt = match self.last_time {
-            Some(last) => ((time - last) as f32).clamp(0.0, 0.1),
+    /// Moves time on and decides how the swarm spends this frame.
+    fn advance(&mut self, time: f64) -> Pace {
+        let elapsed = match self.last_time {
+            Some(last) => ((time - last) as f32).max(0.0),
             None => 0.0,
         };
+        let dt = elapsed.min(0.1);
         self.last_time = Some(time);
         self.time = time;
         if dt > 0.0 {
@@ -323,10 +358,34 @@ impl Renderer {
             let wanted = (self.active as f32 * factor) as u32;
             self.active = round_particles(wanted).min(self.max_particles);
         }
-        dt
+
+        // Following a surface with a single step only works while it moves a
+        // little per frame. Below about 45 fps take two steps, and below 20
+        // (or after a hitch) fall back to a full turn for everyone.
+        let light_steps = if self.frame == 0 || elapsed > 0.05 {
+            0
+        } else if elapsed > 0.0225 {
+            2
+        } else {
+            1
+        };
+        let mut ages = [0.0; PERIOD as usize];
+        for (class, age) in ages.iter_mut().enumerate() {
+            if self.frame > 0 {
+                *age = ((time - self.turn_time[class]) as f32).clamp(0.0, 0.1 * PERIOD as f32);
+            }
+            if light_steps == 0 || (class as u32 + self.frame) % PERIOD == 0 {
+                self.turn_time[class] = time;
+            }
+        }
+        Pace {
+            dt,
+            light_steps,
+            ages,
+        }
     }
 
-    pub fn uniform_bytes(&self, view_proj: &Mat4, prev: &Mat4, dt: f32) -> [u8; UNIFORM_BYTES] {
+    pub fn uniform_bytes(&self, view_proj: &Mat4, prev: &Mat4, pace: &Pace) -> [u8; UNIFORM_BYTES] {
         let cam = &self.camera;
         let b = cam.basis();
         let tan = cam.tan_half_fov();
@@ -334,6 +393,14 @@ impl Renderer {
         let sun = vec3(0.55, 0.62, 0.38).normalize();
         let smooth = self.blend * self.blend * (3.0 - 2.0 * self.blend);
         let t = &self.tuning;
+        // a particle only rolls these dice on its full turn, which comes
+        // round every `PERIOD` frames unless everyone has one every frame
+        let turns = if pace.light_steps == 0 {
+            1
+        } else {
+            PERIOD as i32
+        };
+        let per_turn = |rate: f32| 1.0 - (1.0 - rate.clamp(0.0, 1.0)).powi(turns);
         // the very first frame seeds every particle, not just the active ones
         let active = if self.frame == 0 {
             self.max_particles
@@ -373,14 +440,16 @@ impl Renderer {
                 t.jitter_px,
             ],
             [b.right.x, b.right.y, b.right.z, tan],
-            [b.up.x, b.up.y, b.up.z, dt],
+            [b.up.x, b.up.y, b.up.z, pace.dt],
             [b.fwd.x, b.fwd.y, b.fwd.z, self.debug_mode as f32],
             [
-                t.turnover,
-                t.respawn_rate,
-                t.restart_rate,
+                per_turn(t.turnover),
+                per_turn(t.respawn_rate),
+                per_turn(t.restart_rate),
                 t.depth_tolerance,
             ],
+            pace.ages,
+            [pace.light_steps as f32, 0.0, 0.0, 0.0],
         ];
         for v in floats.into_iter().flatten() {
             put(v.to_le_bytes());
@@ -391,12 +460,12 @@ impl Renderer {
 
     /// Emit the commands for one frame. `time` is in seconds.
     pub fn frame(&mut self, time: f64) {
-        let dt = self.advance(time);
+        let pace = self.advance(time);
 
         let aspect = self.width as f32 / self.height as f32;
         let view_proj = self.camera.view_proj(aspect);
         let prev = self.prev_view_proj.unwrap_or(view_proj);
-        let uniforms = self.uniform_bytes(&view_proj, &prev, dt);
+        let uniforms = self.uniform_bytes(&view_proj, &prev, &pace);
         let count = if self.frame == 0 {
             self.max_particles
         } else {
@@ -408,12 +477,12 @@ impl Renderer {
         let s = &self.sized;
         let c = &mut self.cmds;
         c.write_buffer(self.uniforms, 0, &uniforms);
+        c.clear_buffer(s.depth[dst]);
         c.compute_pass(self.p_simulate, s.simulate[src], groups);
-        c.clear_buffer(s.depth);
+        // simulate has read last frame's counts; now they can go
         c.clear_buffer(s.accum);
-        c.compute_pass(self.p_splat_depth, s.splat_depth[dst], groups);
         c.compute_pass(self.p_splat_color, s.splat_color[dst], groups);
-        c.render_pass(self.p_resolve, s.resolve, 3);
+        c.render_pass(self.p_resolve, s.resolve[dst], 3);
         c.submit();
 
         if self.frame % 15 == 0 {
@@ -483,14 +552,69 @@ mod tests {
     fn uniform_block_matches_wgsl_layout() {
         let r = Renderer::new(640, 360, 100_000);
         let m = r.camera.view_proj(640.0 / 360.0);
-        let bytes = r.uniform_bytes(&m, &m, 0.25);
+        let mut pace = Pace {
+            dt: 0.25,
+            light_steps: 2,
+            ages: [0.1, 0.2, 0.3, 0.4],
+        };
+        let bytes = r.uniform_bytes(&m, &m, &pace);
         let u32_at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
         let f32_at = |o: usize| f32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
         assert_eq!((u32_at(160), u32_at(164)), (640, 360)); // res
         assert_eq!(u32_at(168), r.max_particles);
         assert!((f32_at(204) - r.camera.tan_half_fov()).abs() < 1e-6); // cam_right.w
         assert_eq!(f32_at(220), 0.25); // cam_up.w = dt
-        assert!((f32_at(240) - r.tuning.turnover).abs() < 1e-6); // tune.x
+        let turnover = 1.0 - (1.0 - r.tuning.turnover).powi(PERIOD as i32);
+        assert!((f32_at(240) - turnover).abs() < 1e-6); // tune.x, per full turn
+        assert!((f32_at(252) - r.tuning.depth_tolerance).abs() < 1e-6); // tune.w
+        assert_eq!((f32_at(256), f32_at(268)), (0.1, 0.4)); // ages
+        assert_eq!(f32_at(272), 2.0); // pace.x = light steps
+
+        // with a full turn every frame the rates are per frame again
+        pace.light_steps = 0;
+        let bytes = r.uniform_bytes(&m, &m, &pace);
+        let turnover = f32::from_le_bytes(bytes[240..244].try_into().unwrap());
+        assert!((turnover - r.tuning.turnover).abs() < 1e-6);
+    }
+
+    /// Runs `frames` frames `step` seconds apart and returns the last pace.
+    fn paced(r: &mut Renderer, start: f64, step: f64, frames: u32) -> (f64, Pace) {
+        let mut time = start;
+        let mut pace = None;
+        for _ in 0..frames {
+            time += step;
+            pace = Some(r.advance(time));
+            r.frame += 1;
+        }
+        (time, pace.unwrap())
+    }
+
+    #[test]
+    fn swarm_takes_turns_at_speed_and_stops_when_frames_are_slow() {
+        assert!(PERIOD.is_power_of_two());
+        let mut r = Renderer::new(64, 64, 65_536);
+        // the first frame seeds everything: a full turn for everyone
+        assert_eq!(r.advance(0.0).light_steps, 0);
+        r.frame += 1;
+
+        // 60 fps: one step, and the class due now last had a turn PERIOD frames ago
+        let (time, pace) = paced(&mut r, 0.0, 1.0 / 60.0, 3 * PERIOD);
+        assert_eq!(pace.light_steps, 1);
+        let due = ((PERIOD - (r.frame - 1) % PERIOD) % PERIOD) as usize;
+        assert!((pace.ages[due] - PERIOD as f32 / 60.0).abs() < 1e-5);
+
+        // 30 fps: two steps
+        let (time, pace) = paced(&mut r, time, 1.0 / 30.0, 2 * PERIOD);
+        assert_eq!(pace.light_steps, 2);
+
+        // 10 fps: everyone has a full turn every frame, one frame apart
+        let (time, pace) = paced(&mut r, time, 0.1, 3);
+        assert_eq!(pace.light_steps, 0);
+        assert!(pace.ages.iter().all(|age| (age - 0.1).abs() < 1e-5));
+
+        // back to speed after a hitch
+        let (_, pace) = paced(&mut r, time, 1.0 / 60.0, 2);
+        assert_eq!(pace.light_steps, 1);
     }
 
     #[test]
@@ -508,26 +632,41 @@ mod tests {
         let w = r.cmds.words().to_vec();
         assert_eq!(w[0], OP_WRITE_BUFFER);
         let after_uniforms = 4 + UNIFORM_BYTES / 4;
-        let ops: Vec<u32> = [0, 4, 6, 8, 12, 16, 20]
+        let ops: Vec<u32> = [0, 2, 6, 8, 12, 16]
             .iter()
             .map(|o| w[after_uniforms + o])
             .collect();
         assert_eq!(
             ops,
             [
-                OP_COMPUTE_PASS,
-                OP_CLEAR_BUFFER,
                 OP_CLEAR_BUFFER,
                 OP_COMPUTE_PASS,
+                OP_CLEAR_BUFFER,
                 OP_COMPUTE_PASS,
                 OP_RENDER_PASS,
                 OP_SUBMIT
             ]
         );
-        let first_sim_group = w[after_uniforms + 2];
+        // [cleared depth, simulate group, colour group, resolve group]
+        let picks = |w: &[u32]| [1, 4, 10, 14].map(|o| w[after_uniforms + o]);
+        let first = picks(&w);
         r.cmds.clear();
         r.frame(1.0 / 60.0);
-        assert_ne!(r.cmds.words()[after_uniforms + 2], first_sim_group);
+        let second = picks(r.cmds.words());
+        for (a, b) in first.iter().zip(&second) {
+            assert_ne!(a, b);
+        }
+        r.cmds.clear();
+        r.frame(2.0 / 60.0);
+        assert_eq!(picks(r.cmds.words()), first);
+    }
+
+    #[test]
+    fn the_largest_swarm_fits_one_dispatch_and_one_buffer() {
+        let r = Renderer::new(64, 64, u32::MAX);
+        assert_eq!(r.active_particles(), MAX_PARTICLES);
+        assert!(MAX_PARTICLES / WORKGROUP <= 65_535);
+        assert!(MAX_PARTICLES.checked_mul(PARTICLE_BYTES).is_some());
     }
 
     #[test]
@@ -546,15 +685,17 @@ mod tests {
                 .count(),
             9
         );
-        assert_eq!(
-            &w[18..22],
-            &[
-                OP_CREATE_BUFFER,
-                w[19],
-                128 * 96 * 4,
-                usage::STORAGE | usage::COPY_DST
-            ]
-        );
+        for at in [18, 22] {
+            assert_eq!(
+                &w[at..at + 4],
+                &[
+                    OP_CREATE_BUFFER,
+                    w[at + 1],
+                    128 * 96 * 4,
+                    usage::STORAGE | usage::COPY_DST
+                ]
+            );
+        }
     }
 
     #[test]
